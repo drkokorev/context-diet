@@ -1,7 +1,7 @@
 // Builds the "before / after" transcript for the README GIF from a realistic
 // jest run, using the mod's own compressor. Run from the repo root: npx tsx media/transcript.ts
 import { writeFileSync } from 'node:fs'
-import { diet, fmtTokens, tokensOf } from '../plugins/context-diet/hooks/diet'
+import { diet } from '../plugins/context-diet/hooks/diet'
 
 const dirs = ['components', 'billing', 'auth', 'api', 'hooks', 'utils', 'pages', 'store', 'search', 'i18n']
 const names = ['Button', 'Card', 'Modal', 'invoice', 'session', 'token', 'cart', 'checkout', 'format', 'router', 'query', 'cache', 'locale', 'upload', 'avatar', 'filters', 'table', 'chart', 'toast', 'menu']
@@ -37,7 +37,7 @@ lines.push('', 'Test Suites: 1 failed, 611 passed, 612 total', 'Tests:       1 f
 const raw = lines.join('\n')
 const out = diet({ text: raw, tool: 'Bash', command: 'npm test', target: 2600 })
 const path = '/Users/you/acme-web/.context-diet/out-007.txt'
-const note = `[Context Diet: this Bash output was ${raw.length.toLocaleString('en-US')} characters (≈${fmtTokens(tokensOf(raw.length))} tokens), cut to ${out.text.length.toLocaleString('en-US')}. Kept: ${out.kept}. The full output is saved at ${path}.]`
+const note = `[Context Diet: Bash output cut from ${raw.length.toLocaleString('en-US')} to ${out.text.length.toLocaleString('en-US')} characters. Kept: ${out.kept}. Full output: ${path}. Read it before answering about anything not shown here.]`
 writeFileSync(new URL('./transcript.json', import.meta.url), JSON.stringify({ raw: lines, digest: out.text.split('\n'), note, rawChars: raw.length, keptChars: out.text.length + note.length }, null, 1))
 console.log(raw.length, '->', out.text.length, out.kept)
 console.log(out.text)

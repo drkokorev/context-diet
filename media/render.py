@@ -274,7 +274,7 @@ def main():
 
     # the panel
     panel_lines = render(screens['panel-open'], 80)
-    panel_lines += [[], [('◇ diet −150k tok · 5 cuts', {'color': 'gray'})]]
+    panel_lines += [[], [('◇ diet −151k tok · 5 cuts · 1 reopened', {'color': 'gray'})]]
     panel = draw_lines(panel_lines, cols, 'Context Diet · /diet', os.path.join(out, 'panel.png'),
                        ('Every cut, what it kept, and the file with the full output.', 'cyan'), rows)
 

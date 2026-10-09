@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, Register } from 'claude-code'
 
 import type { DietCut, DietPrefs, DietStats, DietView } from '../types'
-import { diet, fmtTokens, tokensOf } from './diet'
+import { diet, dietDelta, fmtTokens, tokensOf } from './diet'
 
 // Context Diet: trims huge tool outputs before they reach the model's context.
 // The model reads a shortened text with a note on what was cut; the full
@@ -22,6 +22,7 @@ const EMPTY_STATS: DietStats = {
   keptChars: 0,
   passed: 0,
   upgrades: 0,
+  rereads: 0,
   byTool: {},
   log: [],
   lifetimeSaved: 0,
@@ -33,6 +34,8 @@ export const DEFAULT_PREFS: DietPrefs = {
   threshold: 8_000,
   isStatusOn: true,
   isToastOn: true,
+  isDry: false,
+  boost: {},
 }
 
 const stats = atom({ plugin: 'context-diet', key: 'stats' } as const, EMPTY_STATS)
@@ -41,13 +44,22 @@ const view = atom({ plugin: 'context-diet', key: 'view' } as const, { openCut: 0
 
 type Dollar = EngineInterface
 type DietElements = Pick<Elements['terminal'] | Elements['desktop'], 'Box' | 'Text' | 'Button'>
-type CallInfo = { tool: string; label: string; command?: string }
+type CallInfo = { tool: string; label: string; command?: string; sig?: string }
+/** The last full output of a command, to show only what changed when it runs again. */
+type Run = { raw: string; at: number }
 
 // tool calls by tool_use_id, so a result can be traced to its command
 const calls = new Map<string, CallInfo>()
+// the last output of each command this session, by the command's text
+const runs = new Map<string, Run>()
+// saved full outputs by path, so a later Read of one is counted against its cut
+const saved = new Map<string, string>()
+// this project's commands whose output stays whole (/diet keep)
+let keep: string[] = []
 let cwd = ''
 let slot = -1
-let isDirReady = false
+// folders whose .gitignore is known to be in place
+const readyDirs = new Set<string>()
 
 const shorten = (text: string, max: number) => {
   const flat = text.replace(/\s+/g, ' ').trim()
@@ -59,6 +71,13 @@ const toolName = (tool: string) => (tool.startsWith('mcp__') ? tool.split('__').
 
 const fmtChars = (n: number) => (n >= 1000 ? `${fmtTokens(n)}` : String(n))
 const plural = (n: number, word: string) => `${n.toLocaleString('en-US')} ${word}${n === 1 ? '' : 's'}`
+
+/** A command's first two words past env assignments and `cd …&&`: "npm test", "cargo build". */
+export const sigOf = (tool: string, command?: string) => {
+  if (!command) return tool
+  const words = command.replace(/^(?:\s*cd\s+\S+\s*&&)+/, '').trim().split(/\s+/).filter(w => !/^\w+=/.test(w))
+  return words.slice(0, 2).join(' ') || tool
+}
 
 /** Which tools' outputs get cut; MCP tools only when they answer JSON. */
 const isDietTool = (tool: string) => ['Bash', 'BashOutput', 'TaskOutput', 'Grep', 'Glob'].includes(tool) || tool.startsWith('mcp__')
@@ -94,16 +113,17 @@ const takeSlot = () => {
 }
 
 const ensureDir = async ($: Dollar, root: string) => {
-  if (isDirReady) return
+  if (readyDirs.has(root)) return
   const ignore = `${root}/${DIR}/.gitignore`
   if (!(await $.fs.exists(ignore))) {
     await $.fs.write(ignore, '# Context Diet keeps full tool outputs here. Nothing in this folder belongs in git.\n*\n')
   }
-  isDirReady = true
+  readyDirs.add(root)
 }
 
+/** The session's working directory now: it can change during a session, so it is asked each time. */
 const rootOf = async ($: Dollar) => {
-  if (!cwd) cwd = await $.session.cwd()
+  cwd = (await $.session.cwd().catch(() => cwd)) || cwd
   return cwd
 }
 
@@ -122,7 +142,7 @@ const pushStatus = async ($: Dollar) => {
     $.ui.status(undefined)
     return
   }
-  $.ui.status(`◇ diet −${fmtTokens(tokensOf(s.rawChars - s.keptChars))} tok · ${plural(s.cuts, 'cut')}`)
+  $.ui.status(`◇ diet${p.isDry ? ' dry' : ''} −${fmtTokens(tokensOf(s.rawChars - s.keptChars))} tok · ${plural(s.cuts, 'cut')}${s.rereads ? ` · ${s.rereads} reopened` : ''}`)
 }
 
 type Decision = { text: string; cut: DietCut; save: string } | { skip: string }
@@ -133,7 +153,13 @@ type Where = {
   agentId?: string
   /** outputs Claude Code already saved to a file, by that file's path: their full text */
   persisted?: Record<string, string>
+  /** earlier outputs of the same commands */
+  runs?: ReadonlyMap<string, Run>
+  /** commands whose output stays whole in this project */
+  keep?: readonly string[]
 }
+
+const hhmm = (at: number) => new Date(at).toTimeString().slice(0, 5)
 
 // Claude Code moves a very long output to a file itself and shows only its start
 const PERSISTED = /^\s*<persisted-output>[\s\S]*?Full output saved to: (\S+)/
@@ -142,26 +168,29 @@ export const persistedPath = (text: string) => PERSISTED.exec(text)?.[1]
 
 /** Cuts one tool result's text if it is long and the cut saves enough. */
 const cutOne = (raw: string, info: CallInfo, p: DietPrefs, where: Where, savedAt?: string): Decision => {
-  if (raw.length <= p.threshold) return { skip: 'short' }
+  const sig = info.sig ?? sigOf(info.tool, info.command)
+  if (raw.length <= p.threshold * (p.boost?.[sig] ?? 1)) return { skip: 'short' }
   if (info.command && /\.context-diet\/|diet:off/.test(info.command)) return { skip: 'excluded' }
+  if (info.command && where.keep?.some(k => info.command?.includes(k))) return { skip: 'kept' }
   // a digest in place of Claude Code's preview stays near the preview's size
   const target = savedAt ? 3_000 : Math.max(2_000, Math.round(p.threshold / 2))
   let out
   try {
-    out = diet({ text: raw, tool: info.tool, command: info.command, target })
+    const before = info.command ? where.runs?.get(info.command) : undefined
+    const delta = before ? dietDelta(before.raw, raw, target, hhmm(before.at)) : undefined
+    const fresh = diet({ text: raw, tool: info.tool, command: info.command, target })
+    out = delta && delta.text.length < fresh.text.length ? delta : fresh
   } catch {
     return { skip: 'error' }
   }
   if (info.tool.startsWith('mcp__') && out.kind !== 'json') return { skip: 'prose' }
   if (out.text.length > raw.length * 0.7 || raw.length - out.text.length < 2_000) return { skip: 'small gain' }
 
-  const path = savedAt ?? `${where.root}/${DIR}/out-${where.slot()}.txt`
+  const path = savedAt ?? (p.isDry ? '(dry run: not saved)' : `${where.root}/${DIR}/out-${where.slot()}.txt`)
+  const size = raw.length.toLocaleString('en-US')
   const note = savedAt
-    ? `[Context Diet: this ${info.tool} output was ${raw.length.toLocaleString('en-US')} characters (≈${fmtTokens(tokensOf(raw.length))} tokens), too long to show, so Claude Code saved it to ${path}. ` +
-      `In place of only its first lines, here is a digest of the whole output. Kept: ${out.kept}. Read the file with offset/limit, or grep it, for anything else. If your answer depends on what is not shown here, read the file first instead of guessing.]`
-    : `[Context Diet: this ${info.tool} output was ${raw.length.toLocaleString('en-US')} characters (≈${fmtTokens(tokensOf(raw.length))} tokens), ` +
-    `cut to ${out.text.length.toLocaleString('en-US')}. Kept: ${out.kept}. ` +
-    `The full output is saved at ${path} (line 1 is a header). Read it with offset/limit, or grep it, if you need anything that was cut. If your answer depends on what is not shown here, read the file first instead of guessing.]`
+    ? `[Context Diet: digest of a ${size}-character ${info.tool} output that Claude Code saved to ${path}. Kept: ${out.kept}. Read that file before answering about anything not shown here.]`
+    : `[Context Diet: ${info.tool} output cut from ${size} to ${out.text.length.toLocaleString('en-US')} characters. Kept: ${out.kept}. Full output: ${path}. Read it before answering about anything not shown here.]`
   const cut: DietCut = {
     at: where.now,
     tool: info.tool,
@@ -172,10 +201,12 @@ const cutOne = (raw: string, info: CallInfo, p: DietPrefs, where: Where, savedAt
     path,
     preview: out.text.slice(0, 1200),
     keptWhat: out.kept,
+    sig,
     ...(where.agentId ? { agentId: where.agentId } : {}),
     ...(savedAt ? { isUpgrade: true as const } : {}),
+    ...(p.isDry ? { isDry: true as const } : {}),
   }
-  return { text: `${note}\n${out.text}`, cut, save: `# Context Diet · ${info.tool} · ${info.label} · ${new Date(where.now).toISOString()}\n${raw}` }
+  return { text: `${note}\n${out.text}`, cut, save: raw }
 }
 
 type Block = { type: string; [field: string]: unknown }
@@ -190,7 +221,8 @@ export const dietBlocks = (blocks: readonly Block[], origin: { kind?: string; to
   const saves: Save[] = []
   const skipped: string[] = []
   const content: Block[] = []
-  if (!p.isOn) return { content: [...blocks], cuts, saves, skipped }
+  const seen: { command: string; raw: string }[] = []
+  if (!p.isOn) return { content: [...blocks], cuts, saves, skipped, seen }
   for (const block of blocks) {
     if (block.type !== 'tool_result') {
       content.push(block)
@@ -207,6 +239,7 @@ export const dietBlocks = (blocks: readonly Block[], origin: { kind?: string; to
       continue
     }
     const decision = cutOne(raw, known ?? { tool, label: tool }, p, where, raw === shown ? undefined : savedAt)
+    if (known?.command && raw.length > p.threshold / 2) seen.push({ command: known.command, raw })
     if ('skip' in decision) {
       if (decision.skip !== 'short') skipped.push(decision.skip)
       content.push(block)
@@ -214,10 +247,44 @@ export const dietBlocks = (blocks: readonly Block[], origin: { kind?: string; to
     }
     calls.delete(id)
     cuts.push(decision.cut)
+    // a dry run measures only: the model reads the output as it came
+    if (p.isDry) {
+      content.push(block)
+      continue
+    }
     if (!decision.cut.isUpgrade) saves.push({ path: decision.cut.path, text: decision.save })
     content.push({ ...block, content: typeof block.content === 'string' ? decision.text : [{ type: 'text', text: decision.text }] })
   }
-  return { content, cuts, saves, skipped }
+  return { content, cuts, saves, skipped, seen }
+}
+
+const rememberRun = (command: string, raw: string, at: number) => {
+  if (raw.length > 2_000_000) return
+  runs.delete(command)
+  runs.set(command, { raw, at })
+  if (runs.size > 20) runs.delete(runs.keys().next().value as string)
+}
+
+/**
+ * Claude opened a saved full output: the digest was not enough. Counted on the
+ * cut, and after two re-reads of one command's outputs (half its cuts or more)
+ * that command is cut only when twice as long.
+ */
+const countReread = async ($: Dollar, path: string) => {
+  const sig = saved.get(path) ?? ''
+  const s = await update($, stats, cur => ({
+    ...cur,
+    rereads: (cur.rereads ?? 0) + 1,
+    log: cur.log.map(c => (c.path === path ? { ...c, rereads: (c.rereads ?? 0) + 1 } : c)),
+  }))
+  const ofSig = s.log.filter(c => (c.sig ?? c.tool) === sig)
+  const rereads = ofSig.reduce((n, c) => n + (c.rereads ?? 0), 0)
+  if (rereads >= 2 && rereads >= ofSig.length / 2) {
+    const p = await update($, prefs, cur => ({ ...cur, boost: { ...cur.boost, [sig]: Math.min(8, (cur.boost?.[sig] ?? 1) * 2) } }))
+    $.ui.toast(`Context Diet: Claude kept opening the full output of "${sig}", so it is now cut only past ${fmtChars(p.threshold * (p.boost[sig] ?? 1))} characters.`)
+    await update($, stats, cur => ({ ...cur, log: cur.log.map(c => ((c.sig ?? c.tool) === sig ? { ...c, rereads: 0 } : c)) }))
+  }
+  $.ui.invalidate('ui.render')
 }
 
 export const recordCut = async ($: Dollar, cut: DietCut) => {
@@ -236,24 +303,28 @@ export const recordCut = async ($: Dollar, cut: DietCut) => {
       keptChars: cur.keptChars + cut.kept,
       byTool: { ...cur.byTool, [cut.tool]: { cuts: t.cuts + 1, raw: t.raw + cut.raw, kept: t.kept + cut.kept } },
       log: [...cur.log, cut].slice(-LOG_SIZE),
-      lifetimeSaved: cur.lifetimeSaved + (cut.raw - cut.kept),
-      lifetimeCuts: cur.lifetimeCuts + 1,
+      lifetimeSaved: cur.lifetimeSaved + (cut.isDry ? 0 : cut.raw - cut.kept),
+      lifetimeCuts: cur.lifetimeCuts + (cut.isDry ? 0 : 1),
     }
   })
-  void $.store.set('lifetime', { saved: s.lifetimeSaved, cuts: s.lifetimeCuts })
+  if (!cut.isDry) void $.store.set('lifetime', { saved: s.lifetimeSaved, cuts: s.lifetimeCuts })
   await pushStatus($)
   $.ui.invalidate('ui.render')
   const p = await read($, prefs)
-  const saved = tokensOf(cut.raw - cut.kept)
-  if (p.isToastOn && (s.cuts === 1 || saved >= BIG_CUT_TOKENS)) {
-    $.ui.toast(`Context Diet trimmed ${cut.tool} output: ${fmtChars(cut.raw)} → ${fmtChars(cut.kept)} chars, ≈${fmtTokens(saved)} tokens saved. /diet for details`)
+  const tokens = tokensOf(cut.raw - cut.kept)
+  if (p.isToastOn && (s.cuts === 1 || tokens >= BIG_CUT_TOKENS)) {
+    $.ui.toast(
+      cut.isDry
+        ? `Context Diet (dry run) would trim this ${cut.tool} output: ${fmtChars(cut.raw)} → ${fmtChars(cut.kept)} chars, ≈${fmtTokens(tokens)} tokens. Nothing was changed`
+        : `Context Diet trimmed ${cut.tool} output: ${fmtChars(cut.raw)} → ${fmtChars(cut.kept)} chars, ≈${fmtTokens(tokens)} tokens saved. /diet for details`,
+    )
   }
 }
 
 /** Sample cuts for /diet demo, so the panel can be seen before a long session. */
 const demoStats = (s: DietStats, now: number, root: string): DietStats => {
   const sample: [string, string, DietCut['kind'], number, number, string, string][] = [
-    ['Bash', 'npm test', 'log', 182_400, 4_310, 'the first and last lines, 9 of 9 error lines with context, 5 of 5 distinct warnings; repeats folded', '> jest\nPASS src/unit/case0.test.ts (12 ms)\n  … 3,996 similar lines …\nFAIL src/api/user.test.ts\n  ● user › rejects a bad email\n    expect(received).toBe(expected)\nTests: 1 failed, 4000 passed, 4001 total'],
+    ['Bash', 'npm test', 'jest', 182_400, 1_310, 'every failure with its message and code frame, the summary', '[jest] 611 passing files not listed, 1 failing\n> acme-web@2.4.0 test\n… [409 lines cut] …\nFAIL src/billing/invoice.test.ts\n  ● invoice › applies VAT for EU customers\n    Expected: 121.5\n    Received: 120\nTests:       1 failed, 4231 passed, 4232 total'],
     ['Bash', 'git diff', 'diff', 96_800, 3_950, "every file's header and counts, 1 lockfile/generated file reduced to counts, every hunk", '3 files changed, +4012 −36\ndiff --git a/src/app.ts b/src/app.ts\n@@ -10,6 +10,7 @@\n-  const b = 2\n+  const b = 3\ndiff --git a/package-lock.json b/package-lock.json\n  [lockfile/generated: +3990 −30 lines cut]'],
     ['Grep', 'Grep useSession in src', 'grep', 41_200, 3_600, 'match counts for every file, the first 3 matches in each', '612 matches in 48 files\nsrc/app/session.ts (41)\n  12: export function useSession() {\n  … 40 more'],
     ['mcp__github__list_issues', 'github · list_issues', 'json', 233_000, 3_980, 'the structure of an array of 300 items: every key, the first items of each array, strings shortened', '[\n {\n  "number": 812,\n  "title": "Crash on start",\n  "body": "Steps…(+2,410 chars)"\n },\n "… 297 more items (keys: number, title, body, labels, user)"\n]'],
@@ -269,6 +340,7 @@ const demoStats = (s: DietStats, now: number, root: string): DietStats => {
     keptWhat,
     preview,
     path: `${root}/${DIR}/out-00${i + 1}.txt`,
+    ...(i === 2 ? { rereads: 1 } : {}),
   }))
   const byTool: DietStats['byTool'] = {}
   for (const c of log) {
@@ -277,19 +349,23 @@ const demoStats = (s: DietStats, now: number, root: string): DietStats => {
   }
   const raw = log.reduce((n, c) => n + c.raw, 0)
   const kept = log.reduce((n, c) => n + c.kept, 0)
-  return { ...s, cuts: log.length, rawChars: raw, keptChars: kept, byTool, log, lifetimeSaved: Math.max(s.lifetimeSaved, (raw - kept) * 14), lifetimeCuts: Math.max(s.lifetimeCuts, 73) }
+  return { ...s, cuts: log.length, rawChars: raw, keptChars: kept, byTool, log, rereads: 1, lifetimeSaved: Math.max(s.lifetimeSaved, (raw - kept) * 14), lifetimeCuts: Math.max(s.lifetimeCuts, 73) }
 }
 
 const buildReport = (s: DietStats, p: DietPrefs) => {
   const saved = s.rawChars - s.keptChars
   const lines = [
-    `Context Diet is ${p.isOn ? 'on' : 'off'}: cuts Bash, Grep, Glob and MCP JSON outputs over ${p.threshold.toLocaleString('en-US')} characters (≈${fmtTokens(tokensOf(p.threshold))} tokens).`,
+    `Context Diet is ${p.isOn ? (p.isDry ? 'in a dry run (nothing is changed; figures show what would be saved)' : 'on') : 'off'}: cuts Bash, Grep, Glob and MCP JSON outputs over ${p.threshold.toLocaleString('en-US')} characters (≈${fmtTokens(tokensOf(p.threshold))} tokens).`,
     s.cuts
       ? `This session: ${plural(s.cuts, 'cut')}, ${fmtChars(s.rawChars)} → ${fmtChars(s.keptChars)} characters, ≈${fmtTokens(tokensOf(saved))} tokens saved (−${Math.round((saved / Math.max(1, s.rawChars)) * 100)}%).`
       : 'This session: nothing cut yet.',
     `All time: ${plural(s.lifetimeCuts, 'cut')}, ≈${fmtTokens(tokensOf(s.lifetimeSaved))} tokens saved.`,
   ]
   if (s.upgrades) lines.push(`Very long outputs Claude Code saved to a file: ${s.upgrades}, each shown as a digest of the whole output instead of its first lines.`)
+  const cutCount = s.cuts + (s.upgrades ?? 0)
+  if (cutCount) lines.push(`Claude opened a saved full output ${plural(s.rereads ?? 0, 'time')} after ${plural(cutCount, 'cut')}${s.rereads ? ': where that happens often, the command is cut less.' : '.'}`)
+  const boosted = Object.entries(p.boost ?? {})
+  if (boosted.length) lines.push(`Cut less because Claude kept opening their full output: ${boosted.map(([sig, x]) => `"${sig}" (past ${fmtChars(p.threshold * x)} chars)`).join(', ')}.`)
   const tools = Object.entries(s.byTool).sort((a, b) => b[1].raw - b[1].kept - (a[1].raw - a[1].kept))
   if (tools.length) {
     lines.push('', 'By tool:')
@@ -298,7 +374,7 @@ const buildReport = (s: DietStats, p: DietPrefs) => {
   if (s.log.length) {
     lines.push('', 'Latest cuts (full output in the file):')
     for (const c of [...s.log].reverse().slice(0, 10)) {
-      lines.push(`  ${new Date(c.at).toTimeString().slice(0, 5)}  ${c.tool}  ${c.label}  ${c.isUpgrade ? `digest of ${fmtChars(c.raw)}` : `${fmtChars(c.raw)} → ${fmtChars(c.kept)}`}  ${c.path}`)
+      lines.push(`  ${new Date(c.at).toTimeString().slice(0, 5)}  ${c.tool}  ${c.label}  ${c.isUpgrade ? `digest of ${fmtChars(c.raw)}` : `${fmtChars(c.raw)} → ${fmtChars(c.kept)}`}${c.kind === 'delta' ? ' (changes only)' : ''}${c.rereads ? `  reopened ×${c.rereads}` : ''}  ${c.path}`)
     }
   }
   return lines.join('\n')
@@ -317,6 +393,12 @@ const setThreshold = async ($: Dollar, threshold: number) => {
 
 const toggleOn = async ($: Dollar) => {
   await update($, prefs, p => ({ ...p, isOn: !p.isOn }))
+  await pushStatus($)
+  $.ui.invalidate('ui.render')
+}
+
+const toggleDry = async ($: Dollar) => {
+  await update($, prefs, p => ({ ...p, isOn: true, isDry: !p.isDry }))
   await pushStatus($)
   $.ui.invalidate('ui.render')
 }
@@ -342,11 +424,11 @@ const drawDiet = async ($: Dollar, els: DietElements, columns: number) => {
     <Box flexDirection="column">
       <Box flexDirection="row" gap={1} flexWrap="wrap">
         <Text bold color="green">◇ CONTEXT DIET</Text>
-        <Text color={p.isOn ? 'green' : 'yellow'}>{p.isOn ? 'on' : 'off'}</Text>
+        <Text color={p.isOn && !p.isDry ? 'green' : 'yellow'}>{p.isOn ? (p.isDry ? 'dry run: measuring only' : 'on') : 'off'}</Text>
         <Text dimColor>{`cuts outputs over ≈${fmtTokens(tokensOf(p.threshold))} tokens`}</Text>
       </Box>
       <Box flexDirection="row" gap={1} marginTop={1} flexWrap="wrap">
-        <Text dimColor>saved</Text>
+        <Text dimColor>{p.isDry ? 'would save' : 'saved'}</Text>
         <Text bold color="green">{`≈${fmtTokens(tokensOf(saved))} tokens`}</Text>
         <Text dimColor>{s.cuts ? `${plural(s.cuts, 'cut')} · ${fmtChars(s.rawChars)} → ${fmtChars(s.keptChars)} chars (−${pct}%)` : 'nothing cut yet'}</Text>
       </Box>
@@ -354,6 +436,12 @@ const drawDiet = async ($: Dollar, els: DietElements, columns: number) => {
         <Text dimColor>all-time</Text>
         <Text>{`≈${fmtTokens(tokensOf(s.lifetimeSaved))} tokens · ${plural(s.lifetimeCuts, 'cut')}`}</Text>
       </Box>
+      {s.cuts + (s.upgrades ?? 0) ? (
+        <Box flexDirection="row" gap={1}>
+          <Text dimColor>reopened</Text>
+          <Text color={(s.rereads ?? 0) > (s.cuts + (s.upgrades ?? 0)) / 3 ? 'yellow' : undefined}>{`${plural(s.rereads ?? 0, 'time')} Claude opened a full output after a cut`}</Text>
+        </Box>
+      ) : null}
       {s.upgrades ? (
         <Box flexDirection="row" gap={1}>
           <Text dimColor>digests</Text>
@@ -379,7 +467,7 @@ const drawDiet = async ($: Dollar, els: DietElements, columns: number) => {
         ) : (
           recent.map(c => {
             const isOpen = v.openCut === c.at
-            const head = `${isOpen ? '▾' : '▸'} ${new Date(c.at).toTimeString().slice(0, 5)} ${toolName(c.tool)} ${c.isUpgrade ? `digest ${fmtChars(c.raw)}` : `${fmtChars(c.raw)}→${fmtChars(c.kept)}`}`
+            const head = `${isOpen ? '▾' : '▸'} ${new Date(c.at).toTimeString().slice(0, 5)} ${toolName(c.tool)} ${c.isUpgrade ? `digest ${fmtChars(c.raw)}` : `${fmtChars(c.raw)}→${fmtChars(c.kept)}`}${c.kind === 'delta' ? ' Δ' : ''}${c.rereads ? ` ↻${c.rereads}` : ''}`
             const label = shorten(c.label, Math.max(10, width - head.length - 3))
             return (
               <Box key={`cut-${c.at}`} flexDirection="column">
@@ -404,6 +492,7 @@ const drawDiet = async ($: Dollar, els: DietElements, columns: number) => {
       <Box flexDirection="row" gap={1} marginTop={1} flexWrap="wrap">
         <Button key="toggle" variant={p.isOn ? undefined : 'primary'} label={p.isOn ? 'Turn off' : 'Turn on'} onPress={() => toggleOn($)} />
         <Button key="threshold" label={`Cut over: ≈${fmtTokens(tokensOf(p.threshold))} tok`} onPress={() => setThreshold($, nextThreshold)} />
+        <Button key="dry" label={p.isDry ? 'Dry run: on' : 'Dry run: off'} onPress={() => toggleDry($)} />
       </Box>
     </Box>
   )
@@ -415,8 +504,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     cwd = e.cwd
-    isDirReady = false
-    await $.command.register({ name: 'diet', description: 'Context Diet: show what was trimmed, or turn it on/off', argumentHint: '[on|off|report|demo|reset|<chars>]' })
+    keep = ((await $.store.get(`keep:${e.cwd}`)) ?? []) as string[]
+    await $.command.register({ name: 'diet', description: 'Context Diet: show what was trimmed, or turn it on/off', argumentHint: '[on|off|dry|keep <text>|report|<chars>]' })
     await update($, prefs, p => ({ ...DEFAULT_PREFS, ...p }))
     await update($, stats, cur => ({ ...EMPTY_STATS, ...cur }))
     const current = await read($, stats)
@@ -432,7 +521,11 @@ export const register: Register = on => {
   on('tool.call', async ($, e, next) => {
     const args = e as unknown as Record<string, unknown>
     const id = typeof args.tool_use_id === 'string' ? args.tool_use_id : undefined
-    if (id && isDietTool(e.tool)) rememberCall(id, { tool: e.tool, label: labelOf(e.tool, args), command: typeof args.command === 'string' ? args.command : undefined })
+    const command = typeof args.command === 'string' ? args.command : undefined
+    if (id && isDietTool(e.tool)) rememberCall(id, { tool: e.tool, label: labelOf(e.tool, args), command, sig: sigOf(e.tool, command) })
+    const target = [args.file_path, args.path, command].filter((v): v is string => typeof v === 'string').join(' ')
+    const opened = [...saved.keys()].find(path => target.includes(path))
+    if (opened) await countReread($, opened)
     return next(e)
   })
 
@@ -448,22 +541,42 @@ export const register: Register = on => {
       if (path) persisted[path] = await $.fs.read(path).catch(() => undefined) ?? ''
     }
     for (const [path, text] of Object.entries(persisted)) if (!text) delete persisted[path]
-    const where = { root, now: await $.clock.now(), slot: takeSlot, persisted, ...(e.agentId ? { agentId: e.agentId } : {}) }
-    const { content, cuts, saves, skipped } = dietBlocks(e.message.content, e.origin as { kind?: string; tool?: string }, p, where)
+    const now = await $.clock.now()
+    const where = { root, now, slot: takeSlot, persisted, runs, keep, ...(e.agentId ? { agentId: e.agentId } : {}) }
+    const { content, cuts, saves, skipped, seen } = dietBlocks(e.message.content, e.origin as { kind?: string; tool?: string }, p, where)
+    for (const run of seen) rememberRun(run.command, run.raw, now)
     if (skipped.length) await update($, stats, s => ({ ...s, passed: s.passed + skipped.length }))
     if (!cuts.length) return next(e)
-    if (saves.length) await ensureDir($, root)
-    for (const save of saves) await $.fs.write(save.path, save.text)
+    if (p.isDry) {
+      const stored = await next(e)
+      for (const cut of cuts) await recordCut($, cut)
+      return stored
+    }
+    try {
+      if (saves.length) await ensureDir($, root)
+      for (const save of saves) await $.fs.write(save.path, save.text)
+    } catch (error) {
+      // without the saved file the digest would point nowhere: Claude reads the output whole
+      readyDirs.delete(root)
+      await $.store.set('lastError', `${new Date(now).toISOString()} could not save the full output under ${root}/${DIR}: ${String(error)}`).catch(() => undefined)
+      return next(e)
+    }
     void $.store.set('slot', slot)
+    for (const cut of cuts) saved.set(cut.path, cut.sig ?? cut.tool)
     const stored = await next({ ...e, message: { ...e.message, content } })
     for (const cut of cuts) await recordCut($, cut)
     return stored
+  }).catch(async ($, e, next) => {
+    // the output reaches Claude whole; the reason is kept for /diet report
+    const error = next.error as { message?: string } | undefined
+    await $.store.set('lastError', `${new Date(await $.clock.now()).toISOString()} ${error?.message ?? String(next.error)}`).catch(() => undefined)
+    return next(e)
   })
 
   on('command.run', { command: 'diet' }, async ($, e) => {
     const arg = e.args.trim().toLowerCase()
     if (arg === 'on' || arg === 'off') {
-      await update($, prefs, p => ({ ...p, isOn: arg === 'on' }))
+      await update($, prefs, p => ({ ...p, isOn: arg === 'on', isDry: false }))
       await pushStatus($)
       $.ui.invalidate('ui.render')
       return { text: `Context Diet is ${arg}.` }
@@ -474,6 +587,22 @@ export const register: Register = on => {
       if (chars < 1000) return { text: 'Context Diet: the threshold is in characters and must be at least 1000 (for example /diet 8000 or /diet 8k).' }
       await setThreshold($, chars)
       return { text: `Context Diet now cuts outputs over ${chars.toLocaleString('en-US')} characters (≈${fmtTokens(tokensOf(chars))} tokens).` }
+    }
+    if (arg === 'dry' || arg === 'dry on' || arg === 'dry off') {
+      const p = await update($, prefs, cur => ({ ...cur, isOn: true, isDry: arg === 'dry' ? !cur.isDry : arg === 'dry on' }))
+      await pushStatus($)
+      $.ui.invalidate('ui.render')
+      return { text: p.isDry ? 'Context Diet dry run: outputs reach Claude whole; /diet shows what would have been cut and saved. /diet dry off to cut for real.' : 'Context Diet dry run is off: long outputs are cut again.' }
+    }
+    const keepArg = /^(keep|unkeep)(?:\s+(.+))?$/i.exec(e.args.trim())
+    if (keepArg) {
+      const root = await rootOf($)
+      const text = keepArg[2]?.trim()
+      if (text) {
+        keep = keepArg[1]?.toLowerCase() === 'keep' ? [...new Set([...keep, text])] : keep.filter(k => k !== text)
+        await $.store.set(`keep:${root}`, keep)
+      }
+      return { text: keep.length ? `Context Diet keeps whole, in ${root}, the output of any command containing:\n${keep.map(k => `  ${k}`).join('\n')}\n(/diet unkeep <text> removes one)` : `Context Diet: nothing is kept whole in ${root}. /diet keep <text> keeps the output of any command containing that text.` }
     }
     if (arg === 'demo') {
       const now = await $.clock.now()
@@ -491,8 +620,11 @@ export const register: Register = on => {
     }
     const s = await read($, stats)
     const p = await read($, prefs)
-    if (arg === 'report') return { text: buildReport(s, p) }
-    if (arg) return { text: 'Usage: /diet [on|off|report|demo|reset|<chars>], for example /diet 16k' }
+    if (arg === 'report') {
+      const lastError = (await $.store.get('lastError')) as string | undefined
+      return { text: `${buildReport(s, p)}${lastError ? `\n\nLast error (that output reached Claude whole): ${lastError}` : ''}` }
+    }
+    if (arg) return { text: 'Usage: /diet [on|off|dry|keep <text>|unkeep <text>|report|demo|reset|<chars>], for example /diet 16k' }
     const opened = await openPane($)
     if (opened.isPlaced) return { text: 'Context Diet panel opened.' }
     return { text: `${buildReport(s, p)}\n\n(The side panel is not available here: ${opened.reason}.)` }

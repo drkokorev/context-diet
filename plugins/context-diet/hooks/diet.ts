@@ -2,7 +2,13 @@
 // shorter text that keeps what an agent needs (errors, summaries, structure).
 // Nothing here touches the engine, so the tests call these directly.
 
-export type DietKind = 'log' | 'json' | 'diff' | 'grep' | 'paths' | 'table'
+import { clip, levelOf, normalize, plural } from './text'
+import { digestTool } from './tools'
+import type { ToolKind } from './tools'
+
+export { normalize }
+
+export type DietKind = 'log' | 'json' | 'diff' | 'grep' | 'paths' | 'table' | 'delta' | ToolKind
 
 export type DietInput = {
   text: string
@@ -20,33 +26,8 @@ export type DietOutput = {
   kept: string
 }
 
-const ANSI = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Z0-9]/g
-const LONG_LINE = 400
-const IMPORTANT =
-  /\b(?:error|errors|err|failed|failure|failing|fail|fatal|panic|panicked|exception|traceback|warning|warn|denied|refused|forbidden|not found|no such file|cannot|can't|unable|undefined|segmentation fault|assert(?:ion)?|expected|received|timeout|timed out|abort(?:ed)?|killed|exit code|exited with)\b|ERR!|✗|✘|×|FAIL|^\s*at \S+ \(|^\s*File ".*", line \d+|^\s*-->\s|^\s*\^+\s*$|^\s*\d+ (?:passed|failed|tests?)\b|^(?:Tests?|Test Suites|Ran \d+)/i
-// errors outrank warnings: a run's failure must never lose its place to deprecation noise
-const CRITICAL =
-  /\b(?:error|errors|failed|failure|failing|fatal|panic|panicked|exception|traceback|denied|refused|forbidden|not found|no such file|cannot|can't|unable|segmentation fault|assert(?:ion)?|expected|received|timeout|timed out|abort(?:ed)?|killed|exit code|exited with)\b|ERR!|✗|✘|✕|FAIL|●|^\s*at \S+ \(|^\s*File ".*", line \d+|^\s*-->\s|^\s*\^+\s*$|^\s*>\s*\d+\s*\|/i
-const levelOf = (line: string): 0 | 1 | 2 => (CRITICAL.test(line) ? 2 : IMPORTANT.test(line) ? 1 : 0)
 const LOCKFILE =
   /(?:^|\/)(?:package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|Cargo\.lock|poetry\.lock|Pipfile\.lock|uv\.lock|composer\.lock|Gemfile\.lock|go\.sum|flake\.lock|Podfile\.lock|packages\.lock\.json)$|\.min\.(?:js|css)$|\.map$|(?:^|\/)(?:dist|build|vendor|node_modules|__snapshots__)\//
-
-/** Strips colors and cursor codes, keeps the last frame of `\r` progress lines. */
-export const normalize = (text: string): string[] =>
-  text
-    .replace(ANSI, '')
-    .replace(/\r\n/g, '\n')
-    .split('\n')
-    .map(line => {
-      const cr = line.lastIndexOf('\r')
-      return (cr >= 0 ? line.slice(cr + 1) : line).trimEnd()
-    })
-
-const clip = (line: string, max = LONG_LINE) =>
-  line.length > max ? `${line.slice(0, Math.round(max * 0.75))} … [+${line.length - Math.round(max * 0.75)} chars]` : line
-
-const plural = (n: number, word: string) =>
-  `${n.toLocaleString('en-US')} ${n === 1 ? word : /(?:ch|sh|s|x)$/.test(word) ? `${word}es` : /[^aeiou]y$/.test(word) ? `${word.slice(0, -1)}ies` : `${word}s`}`
 
 const isPathLike = (line: string) => /^\.{0,2}\/?[\w@.+~-][\w@.+~/ -]*$/.test(line) && !/\s{2,}/.test(line) && (line.includes('/') || /\.\w{1,8}$/.test(line))
 
@@ -435,8 +416,11 @@ export const diet = (input: DietInput): DietOutput => {
       return dietTable(input.text, input.target)
     case 'paths':
       return dietPaths(input.text, input.target)
-    default:
-      return dietLog(input.text, input.target)
+    default: {
+      const raw = normalize(input.text)
+      const lines = raw.filter((line, i) => line !== '' || (raw[i - 1] ?? '') !== '')
+      return digestTool(lines, input.command ?? '', input.target) ?? dietLog(input.text, input.target)
+    }
   }
 }
 
@@ -445,3 +429,67 @@ export const tokensOf = (chars: number) => Math.round(chars / 4)
 
 export const fmtTokens = (n: number) =>
   n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 10_000 ? `${Math.round(n / 1000)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
+
+// ---------- repeated commands ----------
+
+// what changes between two runs of the same command without meaning anything
+const VOLATILE =
+  /\b\d+(?:\.\d+)?\s?(?:ms|s|sec|secs|m|min|h|µs|us|ns|kB|KiB|MB|MiB|GB|GiB|KB|B|%)\b|\b\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?\b|\b\d{4}-\d{2}-\d{2}[T ][\d:.]+Z?\b|\b[0-9a-f]{7,40}\b|\bpid \d+|\bport \d+/gi
+
+const steady = (line: string) => line.replace(VOLATILE, '#').trim()
+
+/**
+ * A digest of what changed since the previous run of the same command, or
+ * undefined when the runs differ too much for a comparison to be shorter.
+ */
+export const dietDelta = (previous: string, text: string, target: number, since: string): DietOutput | undefined => {
+  const before = normalize(previous).filter(l => l.trim() !== '')
+  const now = normalize(text).filter(l => l.trim() !== '')
+  if (before.length < 10 || now.length < 10) return undefined
+  const pool = new Map<string, number>()
+  for (const l of before) pool.set(steady(l), (pool.get(steady(l)) ?? 0) + 1)
+  const added: number[] = []
+  now.forEach((l, i) => {
+    const key = steady(l)
+    const left = pool.get(key) ?? 0
+    if (left > 0) pool.set(key, left - 1)
+    else added.push(i)
+  })
+  const back = new Map<string, number>()
+  for (const l of now) back.set(steady(l), (back.get(steady(l)) ?? 0) + 1)
+  const removed: string[] = []
+  for (const l of before) {
+    const key = steady(l)
+    const left = back.get(key) ?? 0
+    if (left > 0) back.set(key, left - 1)
+    else removed.push(l)
+  }
+  const similarity = 1 - (added.length + removed.length) / (before.length + now.length)
+  if (similarity < 0.6) return undefined
+
+  // the end of the run is its summary; then the important changes first
+  const tail = now.slice(-6)
+  const pick = (items: string[], budget: number) => {
+    const ranked = items.map((l, i) => ({ l, i, level: levelOf(l) })).sort((a, b) => b.level - a.level || a.i - b.i)
+    const chosen = new Set<number>()
+    let used = 0
+    for (const r of ranked) {
+      const cost = clip(r.l, 300).length + 3
+      if (used + cost > budget) continue
+      chosen.add(r.i)
+      used += cost
+    }
+    const shown = items.filter((_, i) => chosen.has(i)).map(l => `  ${clip(l, 300)}`)
+    if (chosen.size < items.length) shown.push(`  … and ${plural(items.length - chosen.size, 'more line')} …`)
+    return shown
+  }
+  const out = [
+    added.length || removed.length
+      ? `Same command as at ${since}. Compared with that run: ${plural(added.length, 'new line')}, ${plural(removed.length, 'line')} gone, ${plural(now.length - added.length, 'line')} unchanged (timings, sizes and hashes ignored).`
+      : `Same command as at ${since}, and the same output: all ${plural(now.length, 'line')} unchanged (timings, sizes and hashes ignored).`,
+  ]
+  if (added.length) out.push('New in this run:', ...pick(added.map(i => now[i] ?? ''), target * 0.55))
+  if (removed.length) out.push('Gone since then:', ...pick(removed, target * 0.25))
+  out.push('End of this run:', ...tail.map(l => `  ${clip(l, 300)}`))
+  return { text: out.join('\n'), kind: 'delta', kept: `only what changed since the same command at ${since}, and the end of this run` }
+}

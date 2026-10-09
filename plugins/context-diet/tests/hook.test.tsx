@@ -1,7 +1,7 @@
 import type { On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
-import { DEFAULT_PREFS, dietBlocks, persistedPath, rememberCall } from '../hooks/register'
+import { DEFAULT_PREFS, dietBlocks, persistedPath, rememberCall, sigOf } from '../hooks/register'
 
 const PANE = {
   plugin: 'context-diet',
@@ -49,7 +49,7 @@ test('a huge Bash output is cut before it is stored, and saved whole', async () 
   const raw = bigLog()
   const row = cutRow(raw)
   const text = (row.content[0] as unknown as { content: string }).content
-  expect(text).toContain('[Context Diet: this Bash output was')
+  expect(text).toContain('[Context Diet: Bash output cut from')
   expect(text).toContain('FAIL src/api/user.test.ts')
   expect(text).toContain('Tests: 1 failed, 4000 passed')
   expect(text.length).toBeLessThan(raw.length / 5)
@@ -127,7 +127,7 @@ test('a preview Claude Code saved to a file becomes a digest of the whole file',
   expect(persistedPath(preview)).toBe(path)
   const row = dietBlocks([{ type: 'tool_result', tool_use_id: 'p1', content: preview }], { kind: 'tool', tool: 'Bash' }, DEFAULT_PREFS, { ...where, persisted: { [path]: raw } })
   const text = (row.content[0] as unknown as { content: string }).content
-  expect(text).toContain('Claude Code saved it to ' + path)
+  expect(text).toContain('Claude Code saved to ' + path)
   expect(text).toContain('Tests: 1 failed, 4000 passed')
   expect(text.length).toBeLessThan(4000)
   expect(row.saves).toHaveLength(0)
@@ -135,4 +135,52 @@ test('a preview Claude Code saved to a file becomes a digest of the whole file',
   // without the file's text the preview stays as it is
   const kept = dietBlocks([{ type: 'tool_result', tool_use_id: 'p2', content: preview }], { kind: 'tool', tool: 'Bash' }, DEFAULT_PREFS, where)
   expect((kept.content[0] as unknown as { content: string }).content).toBe(preview)
+})
+
+test('a command signature skips cd and env assignments', async () => {
+  expect(sigOf('Bash', 'cd app && FOO=1 npm test -- --ci')).toBe('npm test')
+  expect(sigOf('Grep')).toBe('Grep')
+})
+
+test('a dry run measures the cut but leaves the output whole and saves nothing', async () => {
+  const raw = bigLog()
+  const row = cutRow(raw, 'Bash', 'dry1', { ...DEFAULT_PREFS, isDry: true })
+  expect((row.content[0] as unknown as { content: string }).content).toBe(raw)
+  expect(row.saves).toHaveLength(0)
+  expect(row.cuts[0]?.isDry).toBe(true)
+  expect(row.cuts[0]?.raw).toBe(raw.length)
+})
+
+test('commands kept whole in the project, and boosted ones, pass through', async () => {
+  const raw = bigLog()
+  rememberCall('keep1', { tool: 'Bash', label: 'npm test', command: 'npm test -- --ci' })
+  const kept = dietBlocks([{ type: 'tool_result', tool_use_id: 'keep1', content: raw }], { kind: 'tool', tool: 'Bash' }, DEFAULT_PREFS, { ...where, keep: ['npm test'] })
+  expect((kept.content[0] as unknown as { content: string }).content).toBe(raw)
+  rememberCall('boost1', { tool: 'Bash', label: 'npm test', command: 'npm test' })
+  const boosted = dietBlocks([{ type: 'tool_result', tool_use_id: 'boost1', content: raw }], { kind: 'tool', tool: 'Bash' }, { ...DEFAULT_PREFS, boost: { 'npm test': 100 } }, where)
+  expect((boosted.content[0] as unknown as { content: string }).content).toBe(raw)
+})
+
+test('the second run of a command shows what changed', async () => {
+  // eight failures, one of them replaced by another between the runs
+  const run = (names: string[]) =>
+    [
+      '> jest',
+      Array.from({ length: 3000 }, (_, i) => `PASS src/unit/case${i}.test.ts (${(i * 7) % 90} ms)`).join('\n'),
+      ...names.flatMap(n => [`FAIL src/api/${n}.test.ts`, `  ● ${n} › breaks on input`, '    expect(received).toBe(expected)', '    Expected: 200', '    Received: 500', `      at Object.<anonymous> (src/api/${n}.test.ts:12:5)`]),
+      `Tests: ${names.length} failed, 3000 passed`,
+    ].join('\n')
+  const names = ['user', 'order', 'invoice', 'refund', 'stock', 'search', 'login', 'token']
+  const first = run(names)
+  const second = run([...names.slice(0, 7), 'cart'])
+  rememberCall('run2', { tool: 'Bash', label: 'npm test', command: 'npm test' })
+  const runs = new Map([['npm test', { raw: first, at: 1_800_000_000_000 - 120_000 }]])
+  const row = dietBlocks([{ type: 'tool_result', tool_use_id: 'run2', content: second }], { kind: 'tool', tool: 'Bash' }, DEFAULT_PREFS, { ...where, runs })
+  const text = (row.content[0] as unknown as { content: string }).content
+  expect(row.cuts[0]?.kind).toBe('delta')
+  expect(text).toContain('Same command as at')
+  expect(text).toContain('FAIL src/api/cart.test.ts')
+  expect(text).toContain('FAIL src/api/token.test.ts')
+  expect(row.seen[0]?.command).toBe('npm test')
+  expect(row.saves[0]?.text).toBe(second)
 })
