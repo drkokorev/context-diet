@@ -1,0 +1,8 @@
+{
+  "name": "context-diet",
+  "version": "0.1.0",
+  "description": "Trims huge tool outputs (logs, JSON, diffs, grep, file lists) before they reach Claude's context, and saves the full text to a file Claude can read",
+  "author": { "name": "drkokorev" },
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}

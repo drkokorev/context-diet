@@ -1,0 +1,17 @@
+{
+  "name": "context-diet",
+  "owner": {
+    "name": "drkokorev"
+  },
+  "metadata": {
+    "description": "Context Diet: a Claude Code mod that trims huge tool outputs before they fill the context"
+  },
+  "plugins": [
+    {
+      "name": "context-diet",
+      "source": "./plugins/context-diet",
+      "description": "Trims huge tool outputs (logs, JSON, diffs, grep, file lists) before they reach Claude's context, and saves the full text to a file Claude can read",
+      "version": "0.1.0"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+.claude/
+plugins/*/.claude/
+.context-diet/
+media/screens.jsonl
+media/transcript.json
+media/img/
+.DS_Store
+plugins/*/.claude-plugin/types/
