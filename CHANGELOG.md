@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0 (2026-10-09)
+
+- `/diet capture on`: test and build commands save their whole output to `.context-diet/run-NN.log` before Claude Code can shorten a failing one, so the digest has every failure and the summary. Same command, same shell, same exit code; off by default because the command text changes
+- A Bash call's own output is kept for the digest when Claude Code shortened what the model would see
+- Commands are grouped by the tool itself (`pytest`, `jest`, `go test`), past launchers like `python -m`, `npx` and `uv run`, so one tool's re-reads don't slow the digest of another
+- `/diet report` names outputs digested whole instead of Claude Code's shortened version
+
 ## 0.2.0 (2026-10-09)
 
 - Digests that know the tool: jest and vitest, `node --test`, pytest, `go test`, cargo, tsc, eslint, npm / yarn / pnpm / pip install, `docker build`. Every failure or error with its message and stack, the summary; passing tests counted, not listed; noise shown once per kind with a count

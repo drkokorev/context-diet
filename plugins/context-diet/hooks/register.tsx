@@ -23,6 +23,7 @@ const EMPTY_STATS: DietStats = {
   passed: 0,
   upgrades: 0,
   rereads: 0,
+  recovered: 0,
   byTool: {},
   log: [],
   lifetimeSaved: 0,
@@ -35,6 +36,7 @@ export const DEFAULT_PREFS: DietPrefs = {
   isStatusOn: true,
   isToastOn: true,
   isDry: false,
+  isCapture: false,
   boost: {},
 }
 
@@ -44,7 +46,7 @@ const view = atom({ plugin: 'context-diet', key: 'view' } as const, { openCut: 0
 
 type Dollar = EngineInterface
 type DietElements = Pick<Elements['terminal'] | Elements['desktop'], 'Box' | 'Text' | 'Button'>
-type CallInfo = { tool: string; label: string; command?: string; sig?: string }
+type CallInfo = { tool: string; label: string; command?: string; sig?: string; capture?: string }
 /** The last full output of a command, to show only what changed when it runs again. */
 type Run = { raw: string; at: number }
 
@@ -58,6 +60,8 @@ const saved = new Map<string, string>()
 let keep: string[] = []
 let cwd = ''
 let slot = -1
+// a Bash command's whole output by tool_use_id, taken before Claude Code shortens it
+const fulls = new Map<string, string>()
 // folders whose .gitignore is known to be in place
 const readyDirs = new Set<string>()
 
@@ -75,8 +79,21 @@ const plural = (n: number, word: string) => `${n.toLocaleString('en-US')} ${word
 /** A command's first two words past env assignments and `cd …&&`: "npm test", "cargo build". */
 export const sigOf = (tool: string, command?: string) => {
   if (!command) return tool
-  const words = command.replace(/^(?:\s*cd\s+\S+\s*&&)+/, '').trim().split(/\s+/).filter(w => !/^\w+=/.test(w))
-  return words.slice(0, 2).join(' ') || tool
+  const words = command
+    .replace(/^(?:\s*cd\s+\S+\s*&&)+/, '')
+    .trim()
+    .split(/\s+/)
+    .filter(w => !/^\w+=/.test(w))
+  // past launchers (python -m, npx, uv run…) to the tool itself
+  while (words.length > 1 && /^(?:python[\d.]*|py|npx|bunx|pnpm|yarn|uv|poetry|pipenv|bundle|go|cargo|npm)$/.test(words[0] ?? '')) {
+    if (/^(?:npx|bunx)$/.test(words[0] ?? '')) words.splice(0, 1)
+    else if (/^(?:-m|run|exec|x)$/.test(words[1] ?? '')) words.splice(0, 2)
+    else break
+  }
+  // the tool and its subcommand (npm test, go test, cargo build), never a flag, its value or a path
+  const [first, second] = words
+  if (!first) return tool
+  return second && /^[a-z][a-z0-9_-]*$/.test(second) ? `${first} ${second}` : first
 }
 
 /** Which tools' outputs get cut; MCP tools only when they answer JSON. */
@@ -157,6 +174,8 @@ type Where = {
   runs?: ReadonlyMap<string, Run>
   /** commands whose output stays whole in this project */
   keep?: readonly string[]
+  /** whole Bash outputs by tool_use_id, from before Claude Code shortened them */
+  fulls?: ReadonlyMap<string, string>
 }
 
 const hhmm = (at: number) => new Date(at).toTimeString().slice(0, 5)
@@ -167,7 +186,7 @@ const PERSISTED = /^\s*<persisted-output>[\s\S]*?Full output saved to: (\S+)/
 export const persistedPath = (text: string) => PERSISTED.exec(text)?.[1]
 
 /** Cuts one tool result's text if it is long and the cut saves enough. */
-const cutOne = (raw: string, info: CallInfo, p: DietPrefs, where: Where, savedAt?: string): Decision => {
+const cutOne = (raw: string, info: CallInfo, p: DietPrefs, where: Where, savedAt?: string, shortenedTo?: number): Decision => {
   const sig = info.sig ?? sigOf(info.tool, info.command)
   if (raw.length <= p.threshold * (p.boost?.[sig] ?? 1)) return { skip: 'short' }
   if (info.command && /\.context-diet\/|diet:off/.test(info.command)) return { skip: 'excluded' }
@@ -186,17 +205,20 @@ const cutOne = (raw: string, info: CallInfo, p: DietPrefs, where: Where, savedAt
   if (info.tool.startsWith('mcp__') && out.kind !== 'json') return { skip: 'prose' }
   if (out.text.length > raw.length * 0.7 || raw.length - out.text.length < 2_000) return { skip: 'small gain' }
 
-  const path = savedAt ?? (p.isDry ? '(dry run: not saved)' : `${where.root}/${DIR}/out-${where.slot()}.txt`)
+  const path = savedAt ?? info.capture ?? (p.isDry ? '(dry run: not saved)' : `${where.root}/${DIR}/out-${where.slot()}.txt`)
   const size = raw.length.toLocaleString('en-US')
   const note = savedAt
     ? `[Context Diet: digest of a ${size}-character ${info.tool} output that Claude Code saved to ${path}. Kept: ${out.kept}. Read that file before answering about anything not shown here.]`
+    : shortenedTo !== undefined
+    ? `[Context Diet: Claude Code would have shown only ${shortenedTo.toLocaleString('en-US')} characters of this ${size}-character ${info.tool} output, cutting its middle and end; here is a digest of the whole output. Kept: ${out.kept}. Full output: ${path}. Read it before answering about anything not shown here.]`
     : `[Context Diet: ${info.tool} output cut from ${size} to ${out.text.length.toLocaleString('en-US')} characters. Kept: ${out.kept}. Full output: ${path}. Read it before answering about anything not shown here.]`
   const cut: DietCut = {
     at: where.now,
     tool: info.tool,
     label: info.label,
     kind: out.kind,
-    raw: raw.length,
+    // what Claude would otherwise have read: Claude Code's shortened text, when it shortened it
+    raw: shortenedTo ?? raw.length,
     kept: out.text.length + note.length,
     path,
     preview: out.text.slice(0, 1200),
@@ -205,6 +227,7 @@ const cutOne = (raw: string, info: CallInfo, p: DietPrefs, where: Where, savedAt
     ...(where.agentId ? { agentId: where.agentId } : {}),
     ...(savedAt ? { isUpgrade: true as const } : {}),
     ...(p.isDry ? { isDry: true as const } : {}),
+    ...(shortenedTo !== undefined ? { recoveredFrom: shortenedTo } : {}),
   }
   return { text: `${note}\n${out.text}`, cut, save: raw }
 }
@@ -233,12 +256,15 @@ export const dietBlocks = (blocks: readonly Block[], origin: { kind?: string; to
     const tool = known?.tool ?? (origin.kind === 'tool' && origin.tool ? origin.tool : 'unknown')
     const shown = textOf(block.content)
     const savedAt = shown === undefined ? undefined : persistedPath(shown)
-    const raw = savedAt !== undefined && where.persisted?.[savedAt] !== undefined ? where.persisted[savedAt] : shown
+    const whole = where.fulls?.get(id)
+    // Claude Code shortened it (a failing command's output is cut to about 10,000 characters): digest the whole one
+    const recovered = shown !== undefined && savedAt === undefined && whole !== undefined && whole.length > shown.length + 500 ? whole : undefined
+    const raw = recovered ?? (savedAt !== undefined && where.persisted?.[savedAt] !== undefined ? where.persisted[savedAt] : shown)
     if (raw === undefined || !isDietTool(tool)) {
       content.push(block)
       continue
     }
-    const decision = cutOne(raw, known ?? { tool, label: tool }, p, where, raw === shown ? undefined : savedAt)
+    const decision = cutOne(raw, known ?? { tool, label: tool }, p, where, raw === shown || recovered ? undefined : savedAt, recovered ? shown?.length : undefined)
     if (known?.command && raw.length > p.threshold / 2) seen.push({ command: known.command, raw })
     if ('skip' in decision) {
       if (decision.skip !== 'short') skipped.push(decision.skip)
@@ -252,11 +278,52 @@ export const dietBlocks = (blocks: readonly Block[], origin: { kind?: string; to
       content.push(block)
       continue
     }
-    if (!decision.cut.isUpgrade) saves.push({ path: decision.cut.path, text: decision.save })
+    if (!decision.cut.isUpgrade && !decision.cut.path.endsWith('.log')) saves.push({ path: decision.cut.path, text: decision.save })
     content.push({ ...block, content: typeof block.content === 'string' ? decision.text : [{ type: 'text', text: decision.text }] })
   }
   return { content, cuts, saves, skipped, seen }
 }
+
+/** The whole stdout and stderr of a Bash call as the tool returned them, before the model's view is shortened. */
+export const fullTextOf = (result: unknown): string | undefined => {
+  const r = result as { isError?: boolean; result?: unknown; deny?: string } | undefined
+  if (!r || r.deny !== undefined) return undefined
+  const body = r.result as { stdout?: unknown; stderr?: unknown; persistedOutputPath?: unknown; isImage?: unknown } | string | undefined
+  if (typeof body === 'string') return body
+  if (!body || body.isImage || typeof body.persistedOutputPath === 'string') return undefined
+  const out = typeof body.stdout === 'string' ? body.stdout : ''
+  const err = typeof body.stderr === 'string' ? body.stderr : ''
+  return out && err ? `${out}\n${err}` : out || err || undefined
+}
+
+const keepFull = (id: string, result: unknown) => {
+  const full = fullTextOf(result)
+  if (!full || full.length > 4_000_000) return
+  fulls.set(id, full)
+  if (fulls.size > 20) fulls.delete(fulls.keys().next().value as string)
+}
+
+// test runners and build tools whose whole output /diet capture saves
+const CAPTURABLE =
+  /^(?:cd\s+\S+\s*&&\s*)?(?:\w+=\S+\s+)*(?:(?:npx|bunx|pnpm(?:\s+exec)?|yarn|uv\s+run|poetry\s+run|pipenv\s+run|python[\d.]*\s+-m|bundle\s+exec)\s+)?(?:pytest|jest|vitest|mocha|tsc|eslint|ruff|mypy|rspec|phpunit|go\s+(?:test|build|vet)|cargo\s+(?:test|build|check|clippy)|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|lint|typecheck|check)|make(?:\s+[\w-]+)?|gradle|\.\/gradlew|mvn|dotnet\s+(?:test|build))\b/
+
+const shellQuote = (text: string) => `'${text.replace(/'/g, "'\\''")}'`
+
+/**
+ * A test or build command rewritten to save its whole output before Claude Code
+ * can shorten it: run in the same shell (so a `cd` still sticks), output to the
+ * file, then printed, with the command's own exit code. Undefined for anything
+ * else: pipes, redirects, background jobs, several commands, watch modes.
+ */
+export const captureCommand = (command: string, file: string): string | undefined => {
+  const plain = command.trim()
+  if (!CAPTURABLE.test(plain)) return undefined
+  const rest = plain.replace(/^cd\s+\S+\s*&&\s*/, '')
+  if (/[|<>;`\n]|\$\(|&|--watch\b|\bwatch\b|diet:off/.test(rest)) return undefined
+  return `{ ${plain}\n} > ${shellQuote(file)} 2>&1; __diet_rc=$?; cat ${shellQuote(file)}; (exit $__diet_rc)`
+}
+
+let runSlot = 0
 
 const rememberRun = (command: string, raw: string, at: number) => {
   if (raw.length > 2_000_000) return
@@ -299,6 +366,7 @@ export const recordCut = async ($: Dollar, cut: DietCut) => {
     return {
       ...cur,
       cuts: cur.cuts + 1,
+      recovered: (cur.recovered ?? 0) + (cut.recoveredFrom !== undefined ? 1 : 0),
       rawChars: cur.rawChars + cut.raw,
       keptChars: cur.keptChars + cut.kept,
       byTool: { ...cur.byTool, [cut.tool]: { cuts: t.cuts + 1, raw: t.raw + cut.raw, kept: t.kept + cut.kept } },
@@ -355,13 +423,14 @@ const demoStats = (s: DietStats, now: number, root: string): DietStats => {
 const buildReport = (s: DietStats, p: DietPrefs) => {
   const saved = s.rawChars - s.keptChars
   const lines = [
-    `Context Diet is ${p.isOn ? (p.isDry ? 'in a dry run (nothing is changed; figures show what would be saved)' : 'on') : 'off'}: cuts Bash, Grep, Glob and MCP JSON outputs over ${p.threshold.toLocaleString('en-US')} characters (≈${fmtTokens(tokensOf(p.threshold))} tokens).`,
+    `Context Diet is ${p.isOn ? (p.isDry ? 'in a dry run (nothing is changed; figures show what would be saved)' : 'on') : 'off'}${p.isOn && p.isCapture ? ', with capture' : ''}: cuts Bash, Grep, Glob and MCP JSON outputs over ${p.threshold.toLocaleString('en-US')} characters (≈${fmtTokens(tokensOf(p.threshold))} tokens).`,
     s.cuts
       ? `This session: ${plural(s.cuts, 'cut')}, ${fmtChars(s.rawChars)} → ${fmtChars(s.keptChars)} characters, ≈${fmtTokens(tokensOf(saved))} tokens saved (−${Math.round((saved / Math.max(1, s.rawChars)) * 100)}%).`
       : 'This session: nothing cut yet.',
     `All time: ${plural(s.lifetimeCuts, 'cut')}, ≈${fmtTokens(tokensOf(s.lifetimeSaved))} tokens saved.`,
   ]
   if (s.upgrades) lines.push(`Very long outputs Claude Code saved to a file: ${s.upgrades}, each shown as a digest of the whole output instead of its first lines.`)
+  if (s.recovered) lines.push(`Outputs Claude Code would have cut in the middle and end (failing commands): ${s.recovered}, each digested whole, so the failures at the end were kept.`)
   const cutCount = s.cuts + (s.upgrades ?? 0)
   if (cutCount) lines.push(`Claude opened a saved full output ${plural(s.rereads ?? 0, 'time')} after ${plural(cutCount, 'cut')}${s.rereads ? ': where that happens often, the command is cut less.' : '.'}`)
   const boosted = Object.entries(p.boost ?? {})
@@ -374,7 +443,7 @@ const buildReport = (s: DietStats, p: DietPrefs) => {
   if (s.log.length) {
     lines.push('', 'Latest cuts (full output in the file):')
     for (const c of [...s.log].reverse().slice(0, 10)) {
-      lines.push(`  ${new Date(c.at).toTimeString().slice(0, 5)}  ${c.tool}  ${c.label}  ${c.isUpgrade ? `digest of ${fmtChars(c.raw)}` : `${fmtChars(c.raw)} → ${fmtChars(c.kept)}`}${c.kind === 'delta' ? ' (changes only)' : ''}${c.rereads ? `  reopened ×${c.rereads}` : ''}  ${c.path}`)
+      lines.push(`  ${new Date(c.at).toTimeString().slice(0, 5)}  ${c.tool}  ${c.label}  ${c.isUpgrade ? `digest of ${fmtChars(c.raw)}` : `${fmtChars(c.raw)} → ${fmtChars(c.kept)}`}${c.kind === 'delta' ? ' (changes only)' : ''}${c.recoveredFrom !== undefined ? ' (whole output, not Claude Code\'s shortened one)' : ''}${c.rereads ? `  reopened ×${c.rereads}` : ''}  ${c.path}`)
     }
   }
   return lines.join('\n')
@@ -505,7 +574,7 @@ export const register: Register = on => {
     const started = await next(e)
     cwd = e.cwd
     keep = ((await $.store.get(`keep:${e.cwd}`)) ?? []) as string[]
-    await $.command.register({ name: 'diet', description: 'Context Diet: show what was trimmed, or turn it on/off', argumentHint: '[on|off|dry|keep <text>|report|<chars>]' })
+    await $.command.register({ name: 'diet', description: 'Context Diet: show what was trimmed, or turn it on/off', argumentHint: '[on|off|dry|capture|keep <text>|report|<chars>]' })
     await update($, prefs, p => ({ ...DEFAULT_PREFS, ...p }))
     await update($, stats, cur => ({ ...EMPTY_STATS, ...cur }))
     const current = await read($, stats)
@@ -522,11 +591,24 @@ export const register: Register = on => {
     const args = e as unknown as Record<string, unknown>
     const id = typeof args.tool_use_id === 'string' ? args.tool_use_id : undefined
     const command = typeof args.command === 'string' ? args.command : undefined
-    if (id && isDietTool(e.tool)) rememberCall(id, { tool: e.tool, label: labelOf(e.tool, args), command, sig: sigOf(e.tool, command) })
+    const p = await read($, prefs)
+    let capture: string | undefined
+    let wrapped: string | undefined
+    if (id && e.tool === 'Bash' && command && p.isOn && !p.isDry && p.isCapture && args.run_in_background !== true) {
+      const root = await rootOf($)
+      runSlot = (runSlot % 20) + 1
+      capture = `${root}/${DIR}/run-${String(runSlot).padStart(2, '0')}.log`
+      wrapped = captureCommand(command, capture)
+      if (wrapped) await ensureDir($, root).catch(() => (wrapped = undefined))
+      if (!wrapped) capture = undefined
+    }
+    if (id && isDietTool(e.tool)) rememberCall(id, { tool: e.tool, label: labelOf(e.tool, args), command, sig: sigOf(e.tool, command), ...(capture ? { capture } : {}) })
     const target = [args.file_path, args.path, command].filter((v): v is string => typeof v === 'string').join(' ')
     const opened = [...saved.keys()].find(path => target.includes(path))
     if (opened) await countReread($, opened)
-    return next(e)
+    const result = await next(wrapped ? ({ ...e, command: wrapped } as typeof e) : e)
+    if (id && e.tool === 'Bash') keepFull(id, result)
+    return result
   })
 
   on('session.append', { door: 'tool-result' }, async ($, e, next) => {
@@ -542,7 +624,15 @@ export const register: Register = on => {
     }
     for (const [path, text] of Object.entries(persisted)) if (!text) delete persisted[path]
     const now = await $.clock.now()
-    const where = { root, now, slot: takeSlot, persisted, runs, keep, ...(e.agentId ? { agentId: e.agentId } : {}) }
+    const whole = new Map(fulls)
+    for (const block of e.message.content) {
+      const info = block.type === 'tool_result' ? calls.get(String(block.tool_use_id)) : undefined
+      if (info?.capture) {
+        const text = await $.fs.read(info.capture).catch(() => undefined)
+        if (text) whole.set(String(block.tool_use_id), text)
+      }
+    }
+    const where = { root, now, slot: takeSlot, persisted, runs, keep, fulls: whole, ...(e.agentId ? { agentId: e.agentId } : {}) }
     const { content, cuts, saves, skipped, seen } = dietBlocks(e.message.content, e.origin as { kind?: string; tool?: string }, p, where)
     for (const run of seen) rememberRun(run.command, run.raw, now)
     if (skipped.length) await update($, stats, s => ({ ...s, passed: s.passed + skipped.length }))
@@ -594,6 +684,14 @@ export const register: Register = on => {
       $.ui.invalidate('ui.render')
       return { text: p.isDry ? 'Context Diet dry run: outputs reach Claude whole; /diet shows what would have been cut and saved. /diet dry off to cut for real.' : 'Context Diet dry run is off: long outputs are cut again.' }
     }
+    if (arg === 'capture' || arg === 'capture on' || arg === 'capture off') {
+      const p = await update($, prefs, cur => ({ ...cur, isCapture: arg === 'capture' ? !cur.isCapture : arg === 'capture on' }))
+      return {
+        text: p.isCapture
+          ? 'Context Diet capture is on: test and build commands (pytest, jest, go test, cargo, tsc, npm test…) save their whole output to .context-diet/run-NN.log before Claude Code can shorten it, so the failures at the end of a long failing run are kept. The command Claude Code runs becomes `{ <command>\n} > <file> 2>&1; …`, so a permission rule like Bash(pytest:*) may no longer match it and you may be asked. /diet capture off to stop.'
+          : 'Context Diet capture is off: commands run exactly as Claude writes them.',
+      }
+    }
     const keepArg = /^(keep|unkeep)(?:\s+(.+))?$/i.exec(e.args.trim())
     if (keepArg) {
       const root = await rootOf($)
@@ -624,7 +722,7 @@ export const register: Register = on => {
       const lastError = (await $.store.get('lastError')) as string | undefined
       return { text: `${buildReport(s, p)}${lastError ? `\n\nLast error (that output reached Claude whole): ${lastError}` : ''}` }
     }
-    if (arg) return { text: 'Usage: /diet [on|off|dry|keep <text>|unkeep <text>|report|demo|reset|<chars>], for example /diet 16k' }
+    if (arg) return { text: 'Usage: /diet [on|off|dry|capture [on|off]|keep <text>|unkeep <text>|report|demo|reset|<chars>], for example /diet 16k' }
     const opened = await openPane($)
     if (opened.isPlaced) return { text: 'Context Diet panel opened.' }
     return { text: `${buildReport(s, p)}\n\n(The side panel is not available here: ${opened.reason}.)` }

@@ -27,6 +27,8 @@ export type DietCut = {
   sig?: string
   /** how many times Claude opened the full output afterwards */
   rereads?: number
+  /** Claude Code would have shown only this many characters of it: the digest covers the whole output instead */
+  recoveredFrom?: number
 }
 
 export type DietToolTotals = { cuts: number; raw: number; kept: number }
@@ -42,6 +44,8 @@ export type DietStats = {
   upgrades: number
   /** times Claude opened a saved full output after a cut: a sign the digest was not enough */
   rereads: number
+  /** failing commands' outputs Claude Code would have shortened, digested whole instead */
+  recovered: number
   byTool: Record<string, DietToolTotals>
   log: DietCut[]
   lifetimeSaved: number
@@ -56,6 +60,8 @@ export type DietPrefs = {
   isToastOn: boolean
   /** measure only: compute digests and show the savings, change nothing */
   isDry: boolean
+  /** save the whole output of test and build commands before Claude Code can shorten it */
+  isCapture: boolean
   /** threshold multipliers by command signature, raised when Claude keeps opening the full output */
   boost: Record<string, number>
 }

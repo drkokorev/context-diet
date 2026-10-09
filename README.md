@@ -60,6 +60,24 @@ What it keeps depends on what the output is:
 
 Outputs from Bash, Grep, Glob and MCP tools (JSON only) longer than 8,000 characters (≈2k tokens) get a digest; shorter ones pass as they are. The threshold is one command away: `/diet 16k`.
 
+## Failing tests: the part Claude Code hides
+
+When a command fails, Claude Code shortens its output to about 10,000 characters by cutting the middle and the end, and saves nothing. With a verbose test run, that is exactly where the failures and the summary are: Claude sees thousands of `PASSED` lines and has to run the tests again with `tail` or `grep` to find out what broke.
+
+`/diet capture on` fixes that for test and build commands (pytest, jest, vitest, go test, cargo, tsc, eslint, `npm test`, make, gradle…). The command runs as written, in the same shell, but its output also goes to `.context-diet/run-NN.log`; Context Diet then digests the whole log, so Claude gets every failure with its cause and line, and the summary, on the first run:
+
+```
+[Context Diet: Claude Code would have shown only 10,040 characters of this 51,079-character
+Bash output, cutting its middle and end; here is a digest of the whole output. ...]
+[pytest] 597 PASSED lines not listed; failures, errors and the summary below
+E       AssertionError: assert Decimal('6.59') == Decimal('6.60')
+tests/test_refunds.py:10: AssertionError
+...
+================= 3 failed, 597 passed, 151 warnings in 0.13s ==================
+```
+
+It is off by default because it changes the command Claude Code runs to `{ <command>\n} > <file> 2>&1; …`: a permission rule like `Bash(pytest:*)` may no longer match it, so in the default permission mode you may be asked once more. It never touches commands with pipes, redirects, `;`, `&`, background jobs or watch modes.
+
 ## Running the same command again
 
 The usual loop is run the tests, fix, run them again, five or ten times. When a command's output is long both times, Context Diet shows what changed since the last run instead of the whole digest again: the new lines, the lines that are gone, and the end of this run. Timings, sizes and hashes are ignored when comparing. It picks whichever is shorter, the comparison or a fresh digest.
@@ -103,11 +121,23 @@ A small Python project with 600 tests and two hidden bugs (3 tests fail). Each a
 | Sonnet | 2 of 2 | 2 of 2 | 9 | 6.5 | 59.5k | **56.9k** |
 | Opus | 2 of 2 | 2 of 2 | 5.5 | 4.5 | 60.5k | **58.0k** |
 
+Then the same task with `/diet capture on`, two runs per model again:
+
+| | Without Context Diet | With | With capture |
+| --- | --- | --- | --- |
+| Fixed both bugs | 6 of 6 | 6 of 6 | 6 of 6 |
+| Tool calls | 8.0 | 6.0 | **5.8** |
+| Steps before the first fix | 3.2 | 2.5 | **2.2** |
+| Test re-runs just to find the failure | 0.8 | 0.3 | **0** |
+| Tokens | 60.5k | **56.5k** | 59.1k |
+
+With capture, no agent had to re-run the tests to see what failed: the failures were in the first digest. It reads a little more (the failures themselves, about 3,800 characters) than the plain digest of Claude Code's shortened output, which had no failures in it.
+
 - **Every agent fixed both bugs, with and without.** No test file was changed.
 - **Fewer steps:** 6 tool calls on average instead of 8.
 - **Fewer tokens:** about 7% of the total, which includes some 50k of each agent's fixed instructions; on the task itself, roughly 10k without and 4–5k with, where the mod handled every run.
 - 3 of the 12 long test outputs in the Context Diet group reached the agent whole: the development copy of the mod could not save the full output (most likely a stale working directory while it was being reloaded during the run). It now asks for the working directory on every output, passes the output whole if a save fails, and reports why. Two of those three were Opus runs, which is why Opus gained the least.
-- A limit of Claude Code itself showed up: when a command fails, Claude Code shortens its output to about 10,000 characters by cutting the middle and end, without saving it, so pytest's failure section never reached either group. Agents in both groups re-ran the tests with `tail` or `grep` to see it. Capturing such outputs before they are shortened is on the roadmap.
+- A limit of Claude Code itself showed up: when a command fails, Claude Code shortens its output to about 10,000 characters by cutting the middle and end, without saving it, so pytest's failure section never reached either group. That is what `/diet capture` now fixes (table below).
 
 ## What it leaves alone
 
@@ -147,6 +177,7 @@ The pictures are rendered from the mod's real compressor and panel (`media/` has
 | `/diet report` | Print the report in the transcript, with the last error if there was one |
 | `/diet on` · `off` | Turn it on or off |
 | `/diet dry` | Measure only: nothing is cut, the panel shows what would be saved (`/diet dry off` to cut again) |
+| `/diet capture on` · `off` | Save the whole output of test and build commands before Claude Code shortens a failing one (off by default) |
 | `/diet keep <text>` · `unkeep <text>` | Keep whole, in this project, the output of any command containing the text; `/diet keep` lists them |
 | `/diet 16k` | Cut outputs longer than this many characters (default 8000) |
 | `/diet demo` · `reset` | Fill the panel with sample cuts, or clear this session's figures |
@@ -178,7 +209,6 @@ The compressors are pure functions in `plugins/context-diet/hooks/diet.ts` (logs
 
 ## Roadmap
 
-- Capture the full output of a failing command before Claude Code shortens it
 - More tools: gradle and maven, jest's JSON reporter, playwright, terraform plan
 - Thresholds per tool in `/config`
 - Clearing old saved outputs from the panel

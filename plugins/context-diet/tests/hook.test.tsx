@@ -1,7 +1,7 @@
 import type { On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 
-import { DEFAULT_PREFS, dietBlocks, persistedPath, rememberCall, sigOf } from '../hooks/register'
+import { captureCommand, DEFAULT_PREFS, dietBlocks, fullTextOf, persistedPath, rememberCall, sigOf } from '../hooks/register'
 
 const PANE = {
   plugin: 'context-diet',
@@ -140,6 +140,11 @@ test('a preview Claude Code saved to a file becomes a digest of the whole file',
 test('a command signature skips cd and env assignments', async () => {
   expect(sigOf('Bash', 'cd app && FOO=1 npm test -- --ci')).toBe('npm test')
   expect(sigOf('Grep')).toBe('Grep')
+  expect(sigOf('Bash', 'cd /x/y && python3 -m pytest -v -p no:cacheprovider')).toBe('pytest')
+  expect(sigOf('Bash', 'npx jest --ci')).toBe('jest')
+  expect(sigOf('Bash', 'uv run pytest tests/unit')).toBe('pytest')
+  expect(sigOf('Bash', 'go test ./...')).toBe('go test')
+  expect(sigOf('Bash', 'npm run build')).toBe('build')
 })
 
 test('a dry run measures the cut but leaves the output whole and saves nothing', async () => {
@@ -183,4 +188,45 @@ test('the second run of a command shows what changed', async () => {
   expect(text).toContain('FAIL src/api/token.test.ts')
   expect(row.seen[0]?.command).toBe('npm test')
   expect(row.saves[0]?.text).toBe(second)
+})
+
+test('the whole output of a Bash call is taken from its result record', async () => {
+  expect(fullTextOf({ result: { stdout: 'out', stderr: 'err', interrupted: false } })).toBe('out\nerr')
+  expect(fullTextOf({ isError: true, result: 'Exit code 1\nboom' })).toBe('Exit code 1\nboom')
+  expect(fullTextOf({ result: { stdout: 'x', stderr: '', persistedOutputPath: '/p' } })).toBeUndefined()
+  expect(fullTextOf({ deny: 'no' })).toBeUndefined()
+})
+
+test('a failing output Claude Code shortened is digested whole, failures at the end included', async () => {
+  const whole = [
+    '============================= test session starts ==============================',
+    'collected 600 items',
+    Array.from({ length: 597 }, (_, i) => `tests/test_m.py::test_c[${i}] PASSED                [ ${Math.floor(i / 6)}%]`).join('\n'),
+    '=================================== FAILURES ===================================',
+    '__________________________ test_refund_rounds_half_up __________________________',
+    "E       AssertionError: assert Decimal('6.59') == Decimal('6.60')",
+    'tests/test_refunds.py:10: AssertionError',
+    '=========================== short test summary info ============================',
+    'FAILED tests/test_refunds.py::test_refund_rounds_half_up - AssertionError',
+    '================= 1 failed, 597 passed in 0.14s ==================',
+  ].join('\n')
+  const shown = `Exit code 1\n${whole.slice(0, 5000)}\n\n... [${whole.length - 10000} characters truncated] ...\n\n${whole.slice(15000, 20000)}`
+  rememberCall('rec1', { tool: 'Bash', label: 'pytest', command: 'python3 -m pytest -v' })
+  const row = dietBlocks([{ type: 'tool_result', tool_use_id: 'rec1', content: shown }], { kind: 'tool', tool: 'Bash' }, DEFAULT_PREFS, { ...where, fulls: new Map([['rec1', whole]]) })
+  const text = (row.content[0] as unknown as { content: string }).content
+  expect(text).toContain('would have shown only')
+  expect(text).toContain("Decimal('6.59')")
+  expect(text).toContain('tests/test_refunds.py:10')
+  expect(text).toContain('1 failed, 597 passed')
+  expect(row.cuts[0]?.recoveredFrom).toBe(shown.length)
+  expect(row.cuts[0]?.raw).toBe(shown.length)
+  expect(row.saves[0]?.text).toBe(whole)
+})
+
+test('capture wraps test and build commands only', async () => {
+  const f = '/repo/.context-diet/run-01.log'
+  const wrapped = captureCommand('cd app && python3 -m pytest -v', f)
+  expect(wrapped).toBe("{ cd app && python3 -m pytest -v\n} > '/repo/.context-diet/run-01.log' 2>&1; __diet_rc=$?; cat '/repo/.context-diet/run-01.log'; (exit $__diet_rc)")
+  for (const ok of ['npm test', 'npx jest --ci', 'go test ./...', 'cargo build', 'tsc --noEmit', 'pnpm run lint', 'make check', 'FOO=1 vitest run']) expect(captureCommand(ok, f)).toBeDefined()
+  for (const no of ['ls -la', 'npm test | tail -5', 'pytest > out.txt', 'npm test && rm -rf x', 'jest --watch', 'cat file', 'npm test # diet:off', 'git push', 'pytest; echo done', 'npm test &']) expect(captureCommand(no, f)).toBeUndefined()
 })
